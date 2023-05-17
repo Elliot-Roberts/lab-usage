@@ -1,0 +1,14 @@
+[package]
+name = "lab-usage"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+color-eyre = "0.6.2"
+csv = "1.2.1"
+time = { version = "0.3.21", features = ["parsing", "macros"] }
+
+[dev-dependencies]
+glob = "0.3.1"
