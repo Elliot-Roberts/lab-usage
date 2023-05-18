@@ -4,7 +4,7 @@ use color_eyre::{
     Result,
 };
 use std::{env, ffi::OsString, fmt::Display, path::PathBuf, time::Duration};
-use time::{macros::datetime, PrimitiveDateTime};
+use time::PrimitiveDateTime;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Action {
@@ -63,176 +63,252 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Session {
-    delay: std::time::Duration,
-    duration: std::time::Duration,
+struct ValidSessionTime {
+    start: PrimitiveDateTime,
+    duration: Duration,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+enum SessionTime {
+    Valid(ValidSessionTime),
+    UnknownStart {
+        preceded_by: PrimitiveDateTime,
+        end: PrimitiveDateTime,
+    },
+    UnknownEnd {
+        start: PrimitiveDateTime,
+        followed_by: PrimitiveDateTime,
+    },
+    TimeMachine {
+        entrance: PrimitiveDateTime,
+        exit: PrimitiveDateTime,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OrderCorrectness {
+    InOrder,
+    OutOfOrder,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+struct Session<'u> {
+    time: SessionTime,
+    user: &'u str,
 }
 
 enum CleaningState<'u> {
     InUse {
+        start_order: OrderCorrectness,
         user: &'u str,
-        delay: std::time::Duration,
+        start: PrimitiveDateTime,
     },
-    Unused(std::time::Duration),
+    Unused,
 }
 
-// before I was born at least :P
-const THE_BEGINNING: PrimitiveDateTime = datetime!(2000-01-01 0:00);
-
-fn clean(events: &[Event]) -> Vec<Session> {
+fn sessionize<'u>(events: &'u [Event]) -> Vec<(Session<'u>, OrderCorrectness)> {
     use CleaningState::*;
+    use OrderCorrectness::*;
+    use SessionTime::*;
     let mut sessions = Vec::with_capacity(events.len() / 2);
-    let mut prev_time = THE_BEGINNING;
-    let mut state = Unused(std::time::Duration::ZERO);
+    let mut state = Unused;
+    let mut now = PrimitiveDateTime::MIN;
+    let mut prev_time = PrimitiveDateTime::MIN;
     for event in events {
-        // let since_last: std::time::Duration = (event.time - prev_time)
-        //     .try_into()
-        //     .wrap_err_with(|| eyre!("event is nonchronological: {event:?}"))?;
-        let Ok(since_last) = (event.time - prev_time).try_into() else {
-            eprintln!("bad time: {event:?}");
-            continue
+        let currentness = if event.time >= now {
+            InOrder
+        } else {
+            OutOfOrder
         };
-        prev_time = event.time;
-        state = match (state, event.action) {
-            (InUse { delay, .. }, Action::LogOn) => {
-                // double log-on. throw away first login
-                InUse {
-                    user: &event.user,
-                    delay: delay + since_last,
-                }
-            }
-            (InUse { user, delay }, Action::LogOff) => {
-                if event.user == user {
-                    // normal log off
-                    sessions.push(Session {
-                        delay,
-                        duration: since_last,
-                    });
-                    Unused(std::time::Duration::ZERO)
+        match event.action {
+            Action::LogOn => {
+                if let InUse {
+                    user,
+                    start,
+                    start_order,
+                } = state
+                {
+                    // double log-in
+                    sessions.push((
+                        // first session, missing end
+                        Session {
+                            time: UnknownEnd {
+                                start,
+                                followed_by: event.time,
+                            },
+                            user,
+                        },
+                        start_order,
+                    ));
                 } else {
-                    // missed log off and missed log on (is this possible?)
-                    Unused(delay + since_last)
+                    // normal log-in, nothing special to do
                 }
-            }
-            (Unused(duration), Action::LogOn) => {
-                // normal log on
-                InUse {
+                // start of new session
+                state = InUse {
                     user: &event.user,
-                    delay: duration + since_last,
+                    start: event.time,
+                    start_order: currentness,
                 }
             }
-            (Unused(duration), Action::LogOff) => {
-                // double log off
-                Unused(duration + since_last)
+            Action::LogOff => {
+                if let InUse {
+                    user,
+                    start,
+                    start_order,
+                } = state
+                {
+                    if event.user == user {
+                        let time = if let Ok(duration) = (event.time - start).try_into() {
+                            // normal log-off
+                            Valid(ValidSessionTime { start, duration })
+                        } else {
+                            // log-off is chronologically before log-in
+                            TimeMachine {
+                                entrance: start,
+                                exit: event.time,
+                            }
+                        };
+                        sessions.push((Session { time, user }, start_order));
+                    } else {
+                        // log-off of different user from last known
+                        sessions.push((
+                            Session {
+                                // session for last known user
+                                time: UnknownEnd {
+                                    start,
+                                    followed_by: event.time,
+                                },
+                                user,
+                            },
+                            currentness,
+                        ));
+                        sessions.push((
+                            Session {
+                                // session for new user
+                                time: UnknownStart {
+                                    preceded_by: prev_time,
+                                    end: event.time,
+                                },
+                                user: &event.user,
+                            },
+                            currentness,
+                        ));
+                    }
+                } else {
+                    // double log-off (missed log-on?)
+                    sessions.push((
+                        Session {
+                            time: UnknownStart {
+                                preceded_by: prev_time,
+                                end: event.time,
+                            },
+                            user: &event.user,
+                        },
+                        currentness,
+                    ));
+                }
+                state = Unused;
             }
-        };
+        }
+
+        now = Ord::max(now, event.time);
+        prev_time = event.time;
     }
     sessions
 }
-
-// fn intervals(cleaned: &[(OsString, Vec<Session>)]) -> Vec<Interval<u64, &OsStr>> {
-//     let mut now = Duration::ZERO;
-//     cleaned
-//         .into_iter()
-//         .flat_map(|(name, sessions)| sessions.into_iter().map(|s| (name.as_os_str(), s)))
-//         .map(|(name, s)| {
-//             let start = now + s.delay;
-//             let stop = start + s.duration;
-//             now = stop;
-//             Interval {
-//                 start: start.as_secs(),
-//                 stop: stop.as_secs(),
-//                 val: name,
-//             }
-//         })
-//         .collect()
-// }
 
 enum OverlapState {
     Before,
     During,
 }
 
-fn overlaps(cleaned: &[(OsString, Vec<Session>)]) -> Vec<(Duration, usize)> {
+fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDateTime, usize)> {
+    let mut now = PrimitiveDateTime::MIN;
+
     let num_sessions: usize = cleaned.iter().map(|(_, v)| v.len()).sum();
     let mut changes = Vec::with_capacity(num_sessions * 2);
     let mut count = 0_usize;
-    let mut now = Duration::ZERO;
     let mut fronts = cleaned
         .iter()
-        .map(|(_n, v)| {
-            (
-                OverlapState::Before,
-                Duration::ZERO,
-                v.iter().fuse().peekable(),
-            )
-        })
+        .map(|(_n, v)| (OverlapState::Before, v.iter().fuse().peekable()))
         .collect::<Vec<_>>();
     loop {
         let up_next = fronts
             .iter_mut()
-            .filter_map(|(state, cur, it)| {
-                let Some(&s) = it.peek() else {
+            .filter_map(|(state, it)| {
+                let Some(&session) = it.peek() else {
                     return None;
                 };
-                let time_since = now.checked_sub(*cur).expect("now fell behind");
-                let until_end = match state {
-                    OverlapState::Before => s.delay,
-                    OverlapState::During => s.duration,
-                }
-                .checked_sub(time_since)
-                .expect("advanced now past the end of a session");
-                Some((it, s, state, cur, until_end))
+                let edge = match state {
+                    OverlapState::Before => session.start,
+                    OverlapState::During => session.start + session.duration,
+                };
+                let until: Duration = (edge - now).try_into().expect("messed up ordering");
+                Some((state, it, until))
             })
-            .min_by_key(|(_, _, _, _, until_end)| *until_end);
-        let Some((it, s, state, cur, timestep)) = up_next else {
+            .min_by_key(|(.., until)| *until);
+        let Some((state, it, timestep)) = up_next else {
             break;
         };
-        (*state, *cur, count) = match state {
-            OverlapState::Before => (OverlapState::During, *cur + s.delay, count + 1),
+        (*state, count) = match state {
+            OverlapState::Before => (OverlapState::During, count + 1),
             OverlapState::During => {
                 it.next();
-                (OverlapState::Before, *cur + s.duration, count - 1)
+                (OverlapState::Before, count - 1)
             }
         };
         now += timestep;
-        changes.push((timestep, count));
+        changes.push((now, count));
     }
     changes
 }
 
-fn go(paths: &[PathBuf]) -> Result<()> {
-    let cleaned: Vec<_> = read_from_paths(&paths)?
-        .into_iter()
-        .inspect(|(name, _)| eprintln!("{name:?}"))
-        .map(|(name, list)| (name, clean(&list)))
-        .collect();
-    let mut now = THE_BEGINNING;
-    for (timestep, count) in overlaps(&cleaned) {
-        now += timestep;
-        println!(
-            "{} {:02}:{:02}, {count}",
-            now.date(),
-            now.time().hour(),
-            now.time().minute()
-        )
-    }
-    // dbg!(&cleaned[0].1);
-    // let tree = Lapper::new(intervals(&cleaned));
-    // tree.merge_overlaps();
-    // tree.depth()
-    //     .inspect(|_| print!("."))
-    //     .filter(|d| d.val > 1)
-    //     .for_each(|d| {
-    //         println!(
-    //             "{:?} - {:?} : {}",
-    //             THE_BEGINNING + Duration::from_secs(d.start),
-    //             THE_BEGINNING + Duration::from_secs(d.stop),
-    //             d.val
-    //         );
-    //     });
-    // dbg!(tree.len());
+// 1 day
+const MAX_VALID_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
+// 1 min
+const MIN_VALID_DURATION: Duration = Duration::from_secs(60);
 
+fn go(paths: &[PathBuf]) -> Result<()> {
+    let cleaned = read_from_paths(&paths)?
+        .into_iter()
+        .map(|(name, list)| {
+            (
+                name,
+                sessionize(&list)
+                    .into_iter()
+                    .filter_map(|sess| {
+                        if let (
+                            Session {
+                                time: SessionTime::Valid(valid),
+                                ..
+                            },
+                            OrderCorrectness::InOrder,
+                        ) = sess
+                        {
+                            if valid.duration < MIN_VALID_DURATION {
+                                return None;
+                            }
+                            if valid.duration > MAX_VALID_DURATION {
+                                return None;
+                            }
+                            Some(valid)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    for (time, count) in overlaps(&cleaned) {
+        let date = time.date();
+        let hour = time.time().hour();
+        let minute = time.time().minute();
+        println!("{date} {hour:02}:{minute:02}, {count}",)
+    }
     Ok(())
 }
 
@@ -245,88 +321,11 @@ fn main() -> Result<()> {
 mod tests {
     use color_eyre::Result;
     use glob::glob;
-    use time::PrimitiveDateTime;
 
-    use crate::{go, read_from_paths, Action, Event, THE_BEGINNING};
+    use crate::go;
     #[test]
     fn fab() -> Result<()> {
         let paths: Vec<_> = glob("machine/FAB??.csv")?.into_iter().try_collect()?;
         go(&paths)
-    }
-
-    #[test]
-    fn time_travels() -> Result<()> {
-        let paths: Vec<_> = glob("machine/*.csv")?.into_iter().try_collect()?;
-        read_from_paths(&paths)?
-            .into_iter()
-            .map(|(name, list)| (name, find_time_travels(&list)))
-            .filter(|(_, list)| !list.is_empty())
-            .for_each(|(name, list)| {
-                println!("\n{}", name.to_string_lossy());
-                for (i, tt) in list.into_iter().enumerate() {
-                    print!("{i}");
-                    println!("\t   before: {}", tt.before);
-                    println!("\t    after: {}", tt.after);
-                    println!("\t  skipped:");
-                    for e in tt.skipped {
-                        println!("\t\t{}", e);
-                    }
-                    println!("\tfollowing: {}", tt.following);
-                    println!()
-                }
-            });
-        Ok(())
-    }
-
-    #[derive(Debug)]
-    struct TimeTravel {
-        before: Event,
-        after: Event,
-        skipped: Vec<Event>,
-        following: Event,
-    }
-
-    fn find_time_travels(events: &[Event]) -> Vec<TimeTravel> {
-        let mut x = Vec::new();
-        let mut prev = &Event {
-            time: THE_BEGINNING,
-            user: String::new(),
-            action: Action::LogOff,
-        };
-        let mut current: Option<TimeTravel> = None;
-        for e in events {
-            (prev, current) = match (prev.time <= e.time, current) {
-                (true, None) => {
-                    // normal
-                    (e, None)
-                }
-                (true, Some(mut tt)) => {
-                    // ending
-                    tt.following = e.clone();
-                    x.push(tt);
-                    (e, None)
-                }
-                (false, None) => (
-                    // starting
-                    prev,
-                    Some(TimeTravel {
-                        before: prev.clone(),
-                        after: e.clone(),
-                        skipped: Vec::new(),
-                        following: Event {
-                            time: PrimitiveDateTime::MIN,
-                            user: String::new(),
-                            action: Action::LogOff,
-                        },
-                    }),
-                ),
-                (false, Some(mut tt)) => {
-                    // continuing
-                    tt.skipped.push(e.clone());
-                    (prev, Some(tt))
-                }
-            };
-        }
-        x
     }
 }
