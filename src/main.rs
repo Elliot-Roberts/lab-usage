@@ -1,10 +1,19 @@
 #![feature(iterator_try_collect)]
+#![feature(iter_array_chunks)]
 use color_eyre::{
-    eyre::{bail, eyre, Context},
+    eyre::{bail, eyre},
     Result,
 };
 use std::{
-    cmp, collections::BinaryHeap, env, ffi::OsString, fmt::Display, path::PathBuf, time::Duration,
+    cmp,
+    collections::BinaryHeap,
+    env,
+    ffi::OsString,
+    fmt::Display,
+    fs::File,
+    io::{BufRead, BufReader},
+    path::PathBuf,
+    time::Duration,
 };
 use time::PrimitiveDateTime;
 
@@ -39,25 +48,27 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
             .ok_or_else(|| eyre!("file path {path:?} has no stem"))?
             .to_owned();
         let mut events = Vec::new();
-        for rec in csv::Reader::from_path(path)
-            .wrap_err_with(|| eyre!("failed to read csv from path {path:?}"))?
-            .into_deserialize()
-        {
-            let rec = match rec.wrap_err_with(|| eyre!("bad csv record in {path:?}")) {
-                Ok(rec) => rec,
-                Err(e) => {
-                    eprintln!("{e:?}");
-                    continue;
+        for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
+            let line = line?;
+            let array_chunks = &mut line.split(",").array_chunks();
+            let Some(rec) = array_chunks.next() else {
+                if !line.trim().is_empty() {
+                    eprintln!("line {i} in {path:?} has too few fields: {line}");
                 }
+                continue;
             };
-            let [user, action, _host, _ip, time, _domain]: [String; 6] = rec;
+            let [user, action, _host, _ip, time, _domain] = rec;
             let time = time::PrimitiveDateTime::parse(&time, datetime_format)?;
-            let action = match action.as_str() {
+            let action = match action {
                 "on" => Action::LogOn,
                 "off" => Action::LogOff,
                 _ => bail!("invalid action field '{action}' in file {path:?}"),
             };
-            events.push(Event { time, user, action });
+            events.push(Event {
+                time,
+                user: user.to_string(),
+                action,
+            });
         }
         data.push((name, events));
     }
