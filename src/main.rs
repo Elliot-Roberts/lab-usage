@@ -3,7 +3,9 @@ use color_eyre::{
     eyre::{bail, eyre, Context},
     Result,
 };
-use std::{env, ffi::OsString, fmt::Display, path::PathBuf, time::Duration};
+use std::{
+    cmp, collections::BinaryHeap, env, ffi::OsString, fmt::Display, path::PathBuf, time::Duration,
+};
 use time::PrimitiveDateTime;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -224,43 +226,79 @@ enum OverlapState {
     During,
 }
 
-fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDateTime, usize)> {
-    let mut now = PrimitiveDateTime::MIN;
+struct HostTimelineCursor<It: Iterator<Item = ValidSessionTime>> {
+    current: ValidSessionTime,
+    state: OverlapState,
+    rest: It,
+}
 
+impl<It: Iterator<Item = ValidSessionTime>> PartialEq for HostTimelineCursor<It> {
+    fn eq(&self, other: &Self) -> bool {
+        self.next_transition() == other.next_transition()
+    }
+}
+
+impl<It: Iterator<Item = ValidSessionTime>> Eq for HostTimelineCursor<It> {}
+
+impl<It: Iterator<Item = ValidSessionTime>> PartialOrd for HostTimelineCursor<It> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.next_transition().partial_cmp(&other.next_transition())
+    }
+}
+
+impl<It: Iterator<Item = ValidSessionTime>> Ord for HostTimelineCursor<It> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.next_transition().cmp(&other.next_transition())
+    }
+}
+
+impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
+    fn new(mut it: It) -> Option<Self> {
+        Some(Self {
+            current: it.next()?,
+            state: OverlapState::Before,
+            rest: it,
+        })
+    }
+
+    fn advance(self) -> Option<Self> {
+        match self.state {
+            OverlapState::Before => Some(Self {
+                state: OverlapState::During,
+                ..self
+            }),
+            OverlapState::During => Self::new(self.rest),
+        }
+    }
+
+    fn next_transition(&self) -> PrimitiveDateTime {
+        match self.state {
+            OverlapState::Before => self.current.start,
+            OverlapState::During => self.current.start + self.current.duration,
+        }
+    }
+}
+
+fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDateTime, usize)> {
     let num_sessions: usize = cleaned.iter().map(|(_, v)| v.len()).sum();
     let mut changes = Vec::with_capacity(num_sessions * 2);
     let mut count = 0_usize;
     let mut fronts = cleaned
         .iter()
-        .map(|(_n, v)| (OverlapState::Before, v.iter().fuse().peekable()))
-        .collect::<Vec<_>>();
+        .filter_map(|(_, ss)| HostTimelineCursor::new(ss.iter().cloned()).map(cmp::Reverse))
+        .collect::<BinaryHeap<_>>();
     loop {
-        let up_next = fronts
-            .iter_mut()
-            .filter_map(|(state, it)| {
-                let Some(&session) = it.peek() else {
-                    return None;
-                };
-                let edge = match state {
-                    OverlapState::Before => session.start,
-                    OverlapState::During => session.start + session.duration,
-                };
-                let until: Duration = (edge - now).try_into().expect("messed up ordering");
-                Some((state, it, until))
-            })
-            .min_by_key(|(.., until)| *until);
-        let Some((state, it, timestep)) = up_next else {
+        let Some(up_next) = fronts.pop() else {
             break;
         };
-        (*state, count) = match state {
-            OverlapState::Before => (OverlapState::During, count + 1),
-            OverlapState::During => {
-                it.next();
-                (OverlapState::Before, count - 1)
-            }
-        };
-        now += timestep;
-        changes.push((now, count));
+        match up_next.0.state {
+            OverlapState::Before => count += 1,
+            OverlapState::During => count -= 1,
+        }
+        changes.push((up_next.0.next_transition(), count));
+        if let Some(next) = up_next.0.advance() {
+            fronts.push(cmp::Reverse(next));
+        }
     }
     changes
 }
