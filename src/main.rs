@@ -48,7 +48,7 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
         let mut events = Vec::new();
         for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
             let line = line?;
-            let mut array_chunks = line.split(",").array_chunks();
+            let mut array_chunks = line.split(',').array_chunks();
             let Some(rec) = array_chunks.next() else {
                 if !line.trim().is_empty() {
                     eprintln!("line {i} in {path:?} has too few fields: {line}");
