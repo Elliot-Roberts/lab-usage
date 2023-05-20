@@ -228,6 +228,7 @@ enum OverlapState {
 
 struct HostTimelineCursor<It: Iterator<Item = ValidSessionTime>> {
     current: ValidSessionTime,
+    end: PrimitiveDateTime,
     state: OverlapState,
     rest: It,
 }
@@ -254,8 +255,10 @@ impl<It: Iterator<Item = ValidSessionTime>> Ord for HostTimelineCursor<It> {
 
 impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
     fn new(mut it: It) -> Option<Self> {
+        let current = it.next()?;
         Some(Self {
-            current: it.next()?,
+            current,
+            end: current.start + current.duration,
             state: OverlapState::Before,
             rest: it,
         })
@@ -274,7 +277,7 @@ impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
     fn next_transition(&self) -> PrimitiveDateTime {
         match self.state {
             OverlapState::Before => self.current.start,
-            OverlapState::During => self.current.start + self.current.duration,
+            OverlapState::During => self.end,
         }
     }
 }

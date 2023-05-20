@@ -1,3 +1,6 @@
 /target
 /machine
 /.vscode
+flamegraph.svg
+*.csv
+perf.data*
