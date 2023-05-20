@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use time::PrimitiveDateTime;
+use time::{Date, PrimitiveDateTime, Time};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Action {
@@ -40,8 +40,6 @@ impl Display for Event {
 
 fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
     let mut data = Vec::with_capacity(paths.len());
-    let datetime_format =
-        time::macros::format_description!("[year][month][day][hour repr:24][minute]");
     for path in paths {
         let name = path
             .file_stem()
@@ -50,7 +48,7 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
         let mut events = Vec::new();
         for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
             let line = line?;
-            let array_chunks = &mut line.split(",").array_chunks();
+            let mut array_chunks = line.split(",").array_chunks();
             let Some(rec) = array_chunks.next() else {
                 if !line.trim().is_empty() {
                     eprintln!("line {i} in {path:?} has too few fields: {line}");
@@ -58,7 +56,18 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
                 continue;
             };
             let [user, action, _host, _ip, time, _domain] = rec;
-            let time = time::PrimitiveDateTime::parse(&time, datetime_format)?;
+            if time.len() != 12 {
+                eprintln!("malformed datetime on line {i} in {path:?}: {time}");
+            }
+            let year = time[..4].parse()?;
+            let month: u8 = time[4..6].parse()?;
+            let day = time[6..8].parse()?;
+            let hour = time[8..10].parse()?;
+            let minute = time[10..12].parse()?;
+            let time = PrimitiveDateTime::new(
+                Date::from_calendar_date(year, month.try_into()?, day)?,
+                Time::from_hms(hour, minute, 0)?,
+            );
             let action = match action {
                 "on" => Action::LogOn,
                 "off" => Action::LogOff,
