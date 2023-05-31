@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+ls machine/CAD??.csv | sort | sed --quiet '/23/,/42/p'

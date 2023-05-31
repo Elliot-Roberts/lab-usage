@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+#ls machine/CAD{{0,1}?,2{0,1,2}}.csv
+ls machine/CAD??.csv | sort | sed --quiet '/00/,/22/p'
