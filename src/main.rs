@@ -326,6 +326,37 @@ fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDate
     changes
 }
 
+fn bucketize(
+    changes: &[(PrimitiveDateTime, usize)],
+    bucket_size: Duration,
+    start: PrimitiveDateTime,
+) -> Vec<(PrimitiveDateTime, f64)> {
+    let end = changes.last().unwrap().0;
+    let full_duration = end - start;
+    let buckets = (full_duration / bucket_size).ceil() as usize;
+    let mut bucketized = Vec::with_capacity(buckets);
+    let mut bucket_start = start;
+    let mut bucket_end = bucket_start + bucket_size;
+    let mut prev_change = (PrimitiveDateTime::MIN, 0_usize);
+    let mut sum = 0_f64;
+    for change in changes {
+        while bucket_end <= change.0 {
+            let chunk_start = PrimitiveDateTime::max(bucket_start, prev_change.0);
+            let chunk_size = bucket_end - chunk_start;
+            sum += (chunk_size * prev_change.1 as u32) / bucket_size;
+            bucketized.push((bucket_start, sum));
+            sum = 0_f64;
+            bucket_start = bucket_end;
+            bucket_end += bucket_size;
+        }
+        let chunk_start = PrimitiveDateTime::max(bucket_start, prev_change.0);
+        let chunk_size = change.0 - chunk_start;
+        sum += (chunk_size * prev_change.1 as u32) / bucket_size;
+        prev_change = *change;
+    }
+    bucketized
+}
+
 // 1 day
 const MAX_VALID_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
 // 1 min
@@ -364,7 +395,13 @@ fn go(paths: &[PathBuf]) -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    for (time, count) in overlaps(&cleaned) {
+    let changes = overlaps(&cleaned);
+    // let changes = bucketize(
+    //     &changes,
+    //     Duration::from_secs(60 * 60),
+    //     changes[0].0.replace_time(Time::MIDNIGHT),
+    // );
+    for (time, count) in changes {
         let date = time.date();
         let hour = time.time().hour();
         let minute = time.time().minute();
