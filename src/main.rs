@@ -38,6 +38,19 @@ impl Display for Event {
     }
 }
 
+fn parse_time(time: &str) -> Result<PrimitiveDateTime> {
+    let year = time[..4].parse()?;
+    let month: u8 = time[4..6].parse()?;
+    let day = time[6..8].parse()?;
+    let hour = time[8..10].parse()?;
+    let minute = time[10..12].parse()?;
+    let time = PrimitiveDateTime::new(
+        Date::from_calendar_date(year, month.try_into()?, day)?,
+        Time::from_hms(hour, minute, 0)?,
+    );
+    Ok(time)
+}
+
 fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
     let mut data = Vec::with_capacity(paths.len());
     for path in paths {
@@ -59,15 +72,7 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
             if time.len() != 12 {
                 eprintln!("malformed datetime on line {i} in {path:?}: {time}");
             }
-            let year = time[..4].parse()?;
-            let month: u8 = time[4..6].parse()?;
-            let day = time[6..8].parse()?;
-            let hour = time[8..10].parse()?;
-            let minute = time[10..12].parse()?;
-            let time = PrimitiveDateTime::new(
-                Date::from_calendar_date(year, month.try_into()?, day)?,
-                Time::from_hms(hour, minute, 0)?,
-            );
+            let time = parse_time(time)?;
             let action = match action {
                 "on" => Action::LogOn,
                 "off" => Action::LogOff,
