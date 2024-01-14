@@ -17,11 +17,13 @@ use std::{
 };
 use time::{Date, PrimitiveDateTime, Time};
 
+/// Relevant action a user might take on a host
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Action {
     LogOn,
     LogOff,
 }
+/// Logged event of a user taking an action at a time and date
 #[derive(Debug, Clone)]
 struct Event {
     time: time::PrimitiveDateTime,
@@ -38,6 +40,7 @@ impl Display for Event {
     }
 }
 
+/// Parse time as written in these log files, YYYYMMDDhhmm
 fn parse_time(time: &str) -> Result<PrimitiveDateTime> {
     let year = time[..4].parse()?;
     let month: u8 = time[4..6].parse()?;
@@ -51,24 +54,28 @@ fn parse_time(time: &str) -> Result<PrimitiveDateTime> {
     Ok(time)
 }
 
+/// For each path, parse all the logged events and output alongside the filename stem
 fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
-    let mut data = Vec::with_capacity(paths.len());
+    let mut names_and_events = Vec::with_capacity(paths.len());
     for path in paths {
-        let name = path
+        let name_stem = path
             .file_stem()
             .ok_or_else(|| eyre!("file path {path:?} has no stem"))?
             .to_owned();
         let mut events = Vec::new();
         for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
             let line = line?;
-            let mut array_chunks = line.split(',').array_chunks();
-            let Some(rec) = array_chunks.next() else {
-                if !line.trim().is_empty() {
+            let mut array_chunks = line.split(',').array_chunks::<6>();
+            let Some(record) = array_chunks.next() else {
+                // line had fewer than 6 comma separated fields
+                if line.trim().is_empty() {
+                    // ignore empty lines
+                } else {
                     eprintln!("line {i} in {path:?} has too few fields: {line}");
                 }
                 continue;
             };
-            let [user, action, _host, _ip, time, _domain] = rec;
+            let [user, action, _host, _ip, time, _domain] = record;
             if time.len() != 12 {
                 eprintln!("malformed datetime on line {i} in {path:?}: {time}");
             }
@@ -84,41 +91,56 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
                 action,
             });
         }
-        data.push((name, events));
+        names_and_events.push((name_stem, events));
     }
-    Ok(data)
+    Ok(names_and_events)
 }
 
+/// A well-formed user session with no missing events or time travel.
 #[derive(Debug, Clone, Copy)]
 struct ValidSessionTime {
     start: PrimitiveDateTime,
     duration: Duration,
 }
 
+/// A user session on a host, potentially malformed or missing start or end
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 enum SessionTime {
+    /// Start and end are logged, with start before end
     Valid(ValidSessionTime),
+    /// Only an end event was logged for this session.
+    /// The preceding event provides a lower bound for the start time.
     UnknownStart {
         preceded_by: PrimitiveDateTime,
         end: PrimitiveDateTime,
     },
+    /// Only a start event was logged for this session.
+    /// The following event provides an upper bound for the end time.
     UnknownEnd {
         start: PrimitiveDateTime,
         followed_by: PrimitiveDateTime,
     },
+    /// The log-off for this session was recorded as happening at point in time
+    /// earlier than the recorded log-on time.
     TimeMachine {
-        entrance: PrimitiveDateTime,
-        exit: PrimitiveDateTime,
+        log_on: PrimitiveDateTime,
+        log_off: PrimitiveDateTime,
     },
 }
 
+/// Whether a session appears in the log file in the correct order in time.
+/// That is, while processing the log file from top to bottom, if this session
+/// has log on and off times newer than all logs above it in the file, then it is
+/// considered in-order, otherwise it is out-of-order because a "newer" (later in time)
+/// session was encountered "earlier" (at smaller line number) in the file.
 #[derive(Debug, Clone, Copy)]
 enum OrderCorrectness {
     InOrder,
     OutOfOrder,
 }
 
+/// A period of time a user spent logged onto on a host
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 struct Session<'u> {
@@ -126,22 +148,34 @@ struct Session<'u> {
     user: &'u str,
 }
 
+/// State kept while processing log events for a host into sessions.
 enum CleaningState<'u> {
+    /// Host is in use (most recent event was a log-on)
     InUse {
+        /// Was the login event timestamp the newest timestamp so far?
         start_order: OrderCorrectness,
+        /// User associated with login event
         user: &'u str,
+        /// Timestamp associated with login event
         start: PrimitiveDateTime,
     },
+    /// Host is not in use (most recent event was a log-off, or initial state)
     Unused,
 }
 
+/// Process list of log on and off events into list of user sessions, noting
+/// order correctness.
 fn sessionize<'u>(events: &'u [Event]) -> Vec<(Session<'u>, OrderCorrectness)> {
     use CleaningState::*;
     use OrderCorrectness::*;
     use SessionTime::*;
+    // should be about half as many sessions as log events
     let mut sessions = Vec::with_capacity(events.len() / 2);
+    // will assume that hosts are unused before the events in the log file
     let mut state = Unused;
+    // the newest time witnessed so far
     let mut now = PrimitiveDateTime::MIN;
+    // time of the previous event in the file, equal to `now` when events are in order
     let mut prev_time = PrimitiveDateTime::MIN;
     for event in events {
         let currentness = if event.time >= now {
@@ -193,8 +227,8 @@ fn sessionize<'u>(events: &'u [Event]) -> Vec<(Session<'u>, OrderCorrectness)> {
                         } else {
                             // log-off is chronologically before log-in
                             TimeMachine {
-                                entrance: start,
-                                exit: event.time,
+                                log_on: start,
+                                log_off: event.time,
                             }
                         };
                         sessions.push((Session { time, user }, start_order));
@@ -246,33 +280,53 @@ fn sessionize<'u>(events: &'u [Event]) -> Vec<(Session<'u>, OrderCorrectness)> {
     sessions
 }
 
+/// Here, we are in a sense turning our processed sessions back into log-on and
+/// log-off events for counting concurrent users of a collection of hosts.
+/// Processing into 'sessions' was useful for filtering, but now we need to consider
+/// each event in order from a collection of sources.
+/// For each host in the collection, we maintain a "cursor" into the conceptual timeline
+/// of events from it. `next_transition()` yields the time of the next event, and
+/// `advance()` moves the cursor forward one event.
+/// The cursor `state` member keeps track of whether the cursor is 'before' the
+/// `current` session, (meaning the next event is the log-on for `current`) or 'during'
+/// the `current` session, (meaning the next event is the log-off for `current`).
+struct HostTimelineCursor<It: Iterator<Item = ValidSessionTime>> {
+    current: ValidSessionTime,
+    /// just caching calculation of the end time
+    end: PrimitiveDateTime,
+    state: OverlapState,
+    /// remaining future sessions
+    rest: It,
+}
+
+/// Is the cursor before or during the current session?
+/// That is, is the next event a log-on or a log-off?
 enum OverlapState {
     Before,
     During,
 }
 
-struct HostTimelineCursor<It: Iterator<Item = ValidSessionTime>> {
-    current: ValidSessionTime,
-    end: PrimitiveDateTime,
-    state: OverlapState,
-    rest: It,
-}
-
+/// Allow two cursors to be compared for equality.
 impl<It: Iterator<Item = ValidSessionTime>> PartialEq for HostTimelineCursor<It> {
+    /// Cursors are equal if their next events will be simultaneous.
     fn eq(&self, other: &Self) -> bool {
         self.next_transition() == other.next_transition()
     }
 }
 
+/// Equality of times is an equivalence relation.
 impl<It: Iterator<Item = ValidSessionTime>> Eq for HostTimelineCursor<It> {}
 
+/// Required for implementing `Ord`
 impl<It: Iterator<Item = ValidSessionTime>> PartialOrd for HostTimelineCursor<It> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.next_transition().partial_cmp(&other.next_transition())
     }
 }
 
+/// Allow cursors to be compared for ordering.
 impl<It: Iterator<Item = ValidSessionTime>> Ord for HostTimelineCursor<It> {
+    /// Cursors are ordered by ordering their next events.
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.next_transition().cmp(&other.next_transition())
     }
@@ -289,6 +343,7 @@ impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
         })
     }
 
+    /// Move the cursor forward one event.
     fn advance(self) -> Option<Self> {
         match self.state {
             OverlapState::Before => Some(Self {
@@ -299,6 +354,7 @@ impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
         }
     }
 
+    /// Get the time of the next event.
     fn next_transition(&self) -> PrimitiveDateTime {
         match self.state {
             OverlapState::Before => self.current.start,
@@ -307,12 +363,23 @@ impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
     }
 }
 
-fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDateTime, usize)> {
-    let num_sessions: usize = cleaned.iter().map(|(_, v)| v.len()).sum();
-    let mut changes = Vec::with_capacity(num_sessions * 2);
+/// For the given collection of hosts, count the number of concurrent sessions,
+/// recording the value and timestamp each time it changes. This is in some sense
+/// looking at the 'overlaps' of sessions.
+fn overlaps(
+    hosts_sessions: &[(OsString, Vec<ValidSessionTime>)],
+) -> Vec<(PrimitiveDateTime, usize)> {
+    let total_sessions: usize = hosts_sessions.iter().map(|(_, v)| v.len()).sum();
+    // usage count should change exactly twice for each session.
+    // record of changes
+    let mut changes = Vec::with_capacity(total_sessions * 2);
+    // running count of concurrent users
     let mut count = 0_usize;
-    let mut fronts = cleaned
+    // heap of cursors, ordered by oldest un-processed event
+    let mut fronts = hosts_sessions
         .iter()
+        // we wrap the cursors in a std::cmp::Reverse because the std::collections::BinaryHeap
+        // is a max heap, and we want to pop the cursor with the oldest next event.
         .filter_map(|(_, ss)| HostTimelineCursor::new(ss.iter().cloned()).map(cmp::Reverse))
         .collect::<BinaryHeap<_>>();
     loop {
@@ -320,10 +387,14 @@ fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDate
             break;
         };
         match up_next.0.state {
+            // state was off, so this event is a log-on
             OverlapState::Before => count += 1,
+            // state was on, so this event is a log-off
             OverlapState::During => count -= 1,
         }
+        // record time of transition, and new count
         changes.push((up_next.0.next_transition(), count));
+        // re-insert cursor into heap if it is not finished
         if let Some(next) = up_next.0.advance() {
             fronts.push(cmp::Reverse(next));
         }
@@ -331,7 +402,9 @@ fn overlaps(cleaned: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<(PrimitiveDate
     changes
 }
 
-fn bucketize(
+/// Compute average user count for each chunk (or 'bucket') of time of
+/// a given length. For example, the average number of users each hour.
+pub fn bucketize(
     changes: &[(PrimitiveDateTime, usize)],
     bucket_size: Duration,
     start: PrimitiveDateTime,
@@ -367,6 +440,8 @@ const MAX_VALID_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
 // 1 min
 const MIN_VALID_DURATION: Duration = Duration::from_secs(60);
 
+/// Combine all the above functionality to perform the specific filtering we want
+/// on the provided set of paths, printing the result to standard output.
 fn go(paths: &[PathBuf]) -> Result<()> {
     let cleaned = read_from_paths(&paths)?
         .into_iter()
@@ -376,6 +451,10 @@ fn go(paths: &[PathBuf]) -> Result<()> {
                 sessionize(&list)
                     .into_iter()
                     .filter_map(|sess| {
+                        // keep only sessions with 'valid' times, that appear
+                        // in correct time order in the log file, and that
+                        // are longer than the minimum duration, and shorter
+                        // than the maximum.
                         if let (
                             Session {
                                 time: SessionTime::Valid(valid),
