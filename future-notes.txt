@@ -1,0 +1,3 @@
+allow configuring start date
+customizeable bucketing from command line
+investigate averaging vs max value in time bucket
