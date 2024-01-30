@@ -473,7 +473,32 @@ fn combine_and_display<T: Display + PartialEq, Combiner: ChunkCombiner<T>>(
 /// Combine all the above functionality to perform the specific filtering we want
 /// on the provided set of paths, printing the result to standard output.
 fn go(args: Args) -> Result<()> {
-    let cleaned = read_from_paths(&args.paths)?
+    let mut cleaned = read_from_paths(&args.paths)?;
+    if let Some(start_date) = args.start_date {
+        cleaned
+            .iter_mut()
+            .for_each(|(_, ref mut list)| list.retain(|e| e.time.date() >= start_date));
+    };
+    let cleaned: Vec<_> = if args.multi_user {
+        cleaned
+            .into_iter()
+            .flat_map(|(name, list)| {
+                let group_map = list
+                    .into_iter()
+                    .into_group_map_by(|event| event.user.clone()); // TODO: don't clone here
+                group_map.into_iter().map(move |(username, events)| {
+                    let mut new_name = OsString::with_capacity(name.len() + 1 + username.len());
+                    new_name.push(&name);
+                    new_name.push("-");
+                    new_name.push(username);
+                    (new_name, events)
+                })
+            })
+            .collect()
+    } else {
+        cleaned
+    };
+    let cleaned = cleaned
         .into_iter()
         .map(|(name, list)| {
             (
@@ -599,20 +624,24 @@ impl ChunkCombiner<f32> for AverageCombiner {
 #[derive(Debug, Parser)]
 struct Args {
     /// time granularity of output
-    #[arg(short, long, default_value = "1m")]
+    #[arg(short, long, default_value = "30m")]
     granularity: humantime::Duration,
 
     /// how to combine values within each chunk of time
     #[arg(short, long, default_value = "max")]
     combine: CombiningOperationKind,
 
-    /// date to begin processing from, by default the first day mentioned in the provided logs
+    /// ISO8601 date (YYYY-MM-DD) to begin processing from, by default the first day mentioned in the provided logs
     #[arg(short, long, value_parser = |s: &_| Date::parse(s, &Iso8601::PARSING))]
     start_date: Option<Date>,
 
     /// output only the first of consecutive identical values
     #[arg(short, long)]
     filter_repeats: bool,
+
+    /// count concurrent user sessions on individual machines
+    #[arg(short, long)]
+    multi_user: bool,
 
     /// the paths from which to pull logs
     #[clap(required = true)]
@@ -640,6 +669,7 @@ mod tests {
             combine: CombiningOperationKind::Max,
             start_date: None,
             filter_repeats: true,
+            multi_user: true,
         };
 
         go(args)
