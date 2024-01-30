@@ -1,21 +1,23 @@
 #![feature(iterator_try_collect)]
 #![feature(iter_array_chunks)]
+#![feature(iter_map_windows)]
 use color_eyre::{
     eyre::{bail, eyre},
     Result,
 };
+use itertools::Itertools;
 use std::{
     cmp,
     collections::BinaryHeap,
-    env,
     ffi::OsString,
     fmt::Display,
     fs::File,
     io::{BufRead, BufReader},
+    iter::once,
     path::PathBuf,
     time::Duration,
 };
-use time::{Date, PrimitiveDateTime, Time};
+use time::{format_description::well_known::Iso8601, Date, PrimitiveDateTime, Time};
 
 /// Relevant action a user might take on a host
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -363,12 +365,12 @@ impl<It: Iterator<Item = ValidSessionTime>> HostTimelineCursor<It> {
     }
 }
 
+type CountInstant = (PrimitiveDateTime, usize);
+
 /// For the given collection of hosts, count the number of concurrent sessions,
 /// recording the value and timestamp each time it changes. This is in some sense
 /// looking at the 'overlaps' of sessions.
-fn overlaps(
-    hosts_sessions: &[(OsString, Vec<ValidSessionTime>)],
-) -> Vec<(PrimitiveDateTime, usize)> {
+fn overlaps(hosts_sessions: &[(OsString, Vec<ValidSessionTime>)]) -> Vec<CountInstant> {
     let total_sessions: usize = hosts_sessions.iter().map(|(_, v)| v.len()).sum();
     // usage count should change exactly twice for each session.
     // record of changes
@@ -404,33 +406,43 @@ fn overlaps(
 
 /// Compute average user count for each chunk (or 'bucket') of time of
 /// a given length. For example, the average number of users each hour.
-pub fn bucketize(
-    changes: &[(PrimitiveDateTime, usize)],
+pub fn bucketize<'a, T>(
+    changes: &'a [CountInstant],
     bucket_size: Duration,
     start: PrimitiveDateTime,
-) -> Vec<(PrimitiveDateTime, f64)> {
+    mut combine_operation: impl FnMut(Duration, CountInstant, &'a [CountInstant]) -> T,
+) -> Vec<(PrimitiveDateTime, T)> {
     let end = changes.last().unwrap().0;
     let full_duration = end - start;
     let buckets = (full_duration / bucket_size).ceil() as usize;
     let mut bucketized = Vec::with_capacity(buckets);
-    let mut bucket_start = start;
-    let mut bucket_end = bucket_start + bucket_size;
-    let mut prev_change = (PrimitiveDateTime::MIN, 0_usize);
-    let mut sum = 0_f64;
-    for change in changes {
-        while bucket_end <= change.0 {
-            let chunk_start = PrimitiveDateTime::max(bucket_start, prev_change.0);
-            let chunk_size = bucket_end - chunk_start;
-            sum += (chunk_size * prev_change.1 as u32) / bucket_size;
-            bucketized.push((bucket_start, sum));
-            sum = 0_f64;
-            bucket_start = bucket_end;
-            bucket_end += bucket_size;
+    let mut current_bucket_start = start;
+    let mut current_bucket_end = current_bucket_start + bucket_size;
+    let mut value_before_current_bucket_start = 0;
+    let mut most_recent_value = 0;
+    let mut change_slice = changes;
+    let mut current_bucket_changes = 0;
+    while let Some(next_change) = change_slice.get(current_bucket_changes) {
+        if next_change.0 < current_bucket_end {
+            most_recent_value = next_change.1;
+            current_bucket_changes += 1;
+        } else {
+            let (current_bucket_change_slice, future_changes) =
+                change_slice.split_at(current_bucket_changes);
+
+            let combined = combine_operation(
+                bucket_size,
+                (current_bucket_start, value_before_current_bucket_start),
+                current_bucket_change_slice,
+            );
+            bucketized.push((current_bucket_start, combined));
+
+            current_bucket_start = current_bucket_end;
+            current_bucket_end += bucket_size;
+            value_before_current_bucket_start = most_recent_value;
+            change_slice = future_changes;
+            current_bucket_changes = 0;
         }
-        let chunk_start = PrimitiveDateTime::max(bucket_start, prev_change.0);
-        let chunk_size = change.0 - chunk_start;
-        sum += (chunk_size * prev_change.1 as u32) / bucket_size;
-        prev_change = *change;
     }
     bucketized
 }
@@ -440,10 +452,28 @@ const MAX_VALID_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
 // 1 min
 const MIN_VALID_DURATION: Duration = Duration::from_secs(60);
 
+fn combine_and_display<T: Display + PartialEq, Combiner: ChunkCombiner<T>>(
+    values: &[CountInstant],
+    args: Args,
+) {
+    let start_date = args.start_date.unwrap_or_else(|| values[0].0.date());
+    let start = PrimitiveDateTime::new(start_date, Time::MIDNIGHT);
+    let bucket_size = args.granularity.into();
+    let values = bucketize(&values, bucket_size, start, Combiner::combine);
+    values
+        .into_iter()
+        .dedup_by(|a, b| args.filter_repeats && a.1 == b.1)
+        .for_each(|(time, count)| {
+            let date = time.date();
+            let hour = time.time().hour();
+            let minute = time.time().minute();
+            println!("{date} {hour:02}:{minute:02}, {count}",)
+        });
+}
 /// Combine all the above functionality to perform the specific filtering we want
 /// on the provided set of paths, printing the result to standard output.
-fn go(paths: &[PathBuf]) -> Result<()> {
-    let cleaned = read_from_paths(&paths)?
+fn go(args: Args) -> Result<()> {
+    let cleaned = read_from_paths(&args.paths)?
         .into_iter()
         .map(|(name, list)| {
             (
@@ -479,35 +509,139 @@ fn go(paths: &[PathBuf]) -> Result<()> {
         })
         .collect::<Vec<_>>();
 
-    let changes = overlaps(&cleaned);
-    // let changes = bucketize(
-    //     &changes,
-    //     Duration::from_secs(60 * 60),
-    //     changes[0].0.replace_time(Time::MIDNIGHT),
-    // );
-    for (time, count) in changes {
-        let date = time.date();
-        let hour = time.time().hour();
-        let minute = time.time().minute();
-        println!("{date} {hour:02}:{minute:02}, {count}",)
+    let values = overlaps(&cleaned);
+    match &args.combine {
+        CombiningOperationKind::Max => combine_and_display::<usize, MaxCombiner>(&values, args),
+        CombiningOperationKind::Min => combine_and_display::<usize, MinCombiner>(&values, args),
+        CombiningOperationKind::Avg => combine_and_display::<f32, AverageCombiner>(&values, args),
     }
     Ok(())
 }
 
+use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, ValueEnum)]
+enum CombiningOperationKind {
+    /// take the maximum value observed within the chunk of time
+    Max,
+    /// take the minimum value observed within the chunk of time
+    Min,
+    /// compute the duration-weighted average value for the chunk of time
+    Avg,
+}
+
+trait ChunkCombiner<T> {
+    fn combine(bucket_size: Duration, initial: CountInstant, changes: &[CountInstant]) -> T;
+}
+
+trait PureReducer<A, B> {
+    fn single(a: A) -> B;
+    fn reduce(acc: B, next: A) -> B;
+}
+
+struct MinCombiner;
+impl PureReducer<CountInstant, usize> for MinCombiner {
+    fn reduce(acc: usize, (_, next): CountInstant) -> usize {
+        cmp::min(acc, next)
+    }
+
+    fn single((_, value): CountInstant) -> usize {
+        value
+    }
+}
+struct MaxCombiner;
+impl PureReducer<CountInstant, usize> for MaxCombiner {
+    fn reduce(acc: usize, (_, next): CountInstant) -> usize {
+        cmp::max(acc, next)
+    }
+
+    fn single((_, value): CountInstant) -> usize {
+        value
+    }
+}
+impl<T, Reducer: PureReducer<CountInstant, T>> ChunkCombiner<T> for Reducer {
+    fn combine(
+        _d: Duration,
+        initial @ (bucket_start, _): CountInstant,
+        changes: &[CountInstant],
+    ) -> T {
+        if let Some((first @ (first_change_time, _), following_changes)) = changes.split_first() {
+            let (initial, rest) = if *first_change_time == bucket_start {
+                (*first, following_changes)
+            } else {
+                (initial, changes)
+            };
+            return rest
+                .iter()
+                .cloned()
+                .fold(Self::single(initial), Self::reduce);
+        } else {
+            Self::single(initial)
+        }
+    }
+}
+
+struct AverageCombiner;
+impl ChunkCombiner<f32> for AverageCombiner {
+    fn combine(bucket_size: Duration, initial: CountInstant, changes: &[CountInstant]) -> f32 {
+        let sum_user_seconds: usize = once(&initial)
+            .chain(changes)
+            .chain(once(&(initial.0 + bucket_size, 0)))
+            .map_windows(|[(start_time, start_val), (end_time, _)]| {
+                ((*end_time - *start_time).unsigned_abs(), start_val)
+            })
+            .map(|(duration, users)| duration.as_secs() as usize * users)
+            .sum();
+        sum_user_seconds as f32 / bucket_size.as_secs_f32()
+    }
+}
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// time granularity of output
+    #[arg(short, long, default_value = "1m")]
+    granularity: humantime::Duration,
+
+    /// how to combine values within each chunk of time
+    #[arg(short, long, default_value = "max")]
+    combine: CombiningOperationKind,
+
+    /// date to begin processing from, by default the first day mentioned in the provided logs
+    #[arg(short, long, value_parser = |s: &_| Date::parse(s, &Iso8601::PARSING))]
+    start_date: Option<Date>,
+
+    /// output only the first of consecutive identical values
+    #[arg(short, long)]
+    filter_repeats: bool,
+
+    /// the paths from which to pull logs
+    #[clap(required = true)]
+    paths: Vec<PathBuf>,
+}
+
 fn main() -> Result<()> {
-    let paths: Vec<_> = env::args().map(Into::into).skip(1).collect();
-    go(&paths)
+    let args = Args::parse();
+    go(args)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use color_eyre::Result;
     use glob::glob;
 
-    use crate::go;
+    use crate::*;
     #[test]
     fn fab() -> Result<()> {
-        let paths: Vec<_> = glob("machine/FAB??.csv")?.into_iter().try_collect()?;
-        go(&paths)
+        let args = Args {
+            paths: glob("machine/FAB??.csv")?.into_iter().try_collect()?,
+            granularity: humantime::Duration::from_str("1m")?,
+            combine: CombiningOperationKind::Max,
+            start_date: None,
+            filter_repeats: true,
+        };
+
+        go(args)
     }
 }
