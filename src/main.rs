@@ -123,7 +123,7 @@ enum SessionTime {
         start: PrimitiveDateTime,
         followed_by: PrimitiveDateTime,
     },
-    /// The log-off for this session was recorded as happening at point in time
+    /// The log-off for this session was recorded as happening at a point in time
     /// earlier than the recorded log-on time.
     TimeMachine {
         log_on: PrimitiveDateTime,
@@ -447,11 +447,6 @@ pub fn bucketize<'a, T>(
     bucketized
 }
 
-// 1 day
-const MAX_VALID_DURATION: Duration = Duration::from_secs(60 * 60 * 24);
-// 1 min
-const MIN_VALID_DURATION: Duration = Duration::from_secs(60);
-
 fn combine_and_display<T: Display + PartialEq, Combiner: ChunkCombiner<T>>(
     values: &[CountInstant],
     args: Args,
@@ -518,10 +513,10 @@ fn go(args: Args) -> Result<()> {
                             OrderCorrectness::InOrder,
                         ) = sess
                         {
-                            if valid.duration < MIN_VALID_DURATION {
+                            if valid.duration < *args.min_duration {
                                 return None;
                             }
-                            if valid.duration > MAX_VALID_DURATION {
+                            if valid.duration > *args.max_duration {
                                 return None;
                             }
                             Some(valid)
@@ -644,8 +639,16 @@ struct Args {
     multi_user: bool,
 
     /// the paths from which to pull logs
-    #[clap(required = true)]
+    #[arg(required = true)]
     paths: Vec<PathBuf>,
+
+    /// sessions with durations shorter than this will be filtered out
+    #[arg(long, default_value = "1m")]
+    min_duration: humantime::Duration,
+
+    /// sessions with durations longer than this will be filtered out
+    #[arg(long, default_value = "1d")]
+    max_duration: humantime::Duration,
 }
 
 fn main() -> Result<()> {
@@ -670,6 +673,8 @@ mod tests {
             start_date: None,
             filter_repeats: true,
             multi_user: true,
+            min_duration: humantime::Duration::from_str("1m")?,
+            max_duration: humantime::Duration::from_str("1d")?,
         };
 
         go(args)
