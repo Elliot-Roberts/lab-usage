@@ -167,7 +167,7 @@ enum CleaningState<'u> {
 
 /// Process list of log on and off events into list of user sessions, noting
 /// order correctness.
-fn sessionize<'u>(events: &'u [Event]) -> Vec<(Session<'u>, OrderCorrectness)> {
+fn sessionize(events: &[Event]) -> Vec<(Session<'_>, OrderCorrectness)> {
     use CleaningState::*;
     use OrderCorrectness::*;
     use SessionTime::*;
@@ -322,7 +322,7 @@ impl<It: Iterator<Item = ValidSessionTime>> Eq for HostTimelineCursor<It> {}
 /// Required for implementing `Ord`
 impl<It: Iterator<Item = ValidSessionTime>> PartialOrd for HostTimelineCursor<It> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.next_transition().partial_cmp(&other.next_transition())
+        Some(self.cmp(other))
     }
 }
 
@@ -454,7 +454,7 @@ fn combine_and_display<T: Display + PartialEq, Combiner: ChunkCombiner<T>>(
     let start_date = args.start_date.unwrap_or_else(|| values[0].0.date());
     let start = PrimitiveDateTime::new(start_date, Time::MIDNIGHT);
     let bucket_size = args.granularity.into();
-    let values = bucketize(&values, bucket_size, start, Combiner::combine);
+    let values = bucketize(values, bucket_size, start, Combiner::combine);
     values
         .into_iter()
         .dedup_by(|a, b| args.filter_repeats && a.1 == b.1)
@@ -462,7 +462,7 @@ fn combine_and_display<T: Display + PartialEq, Combiner: ChunkCombiner<T>>(
             let date = time.date();
             let hour = time.time().hour();
             let minute = time.time().minute();
-            println!("{date} {hour:02}:{minute:02}, {count}",)
+            println!("{date} {hour:02}:{minute:02}, {count}")
         });
 }
 /// Combine all the above functionality to perform the specific filtering we want
@@ -496,36 +496,37 @@ fn go(args: Args) -> Result<()> {
     let cleaned = cleaned
         .into_iter()
         .map(|(name, list)| {
-            (
-                name,
-                sessionize(&list)
-                    .into_iter()
-                    .filter_map(|sess| {
-                        // keep only sessions with 'valid' times, that appear
-                        // in correct time order in the log file, and that
-                        // are longer than the minimum duration, and shorter
-                        // than the maximum.
-                        if let (
-                            Session {
-                                time: SessionTime::Valid(valid),
-                                ..
-                            },
-                            OrderCorrectness::InOrder,
-                        ) = sess
-                        {
-                            if valid.duration < *args.min_duration {
-                                return None;
-                            }
-                            if valid.duration > *args.max_duration {
-                                return None;
-                            }
-                            Some(valid)
-                        } else {
-                            None
+            let sessions = sessionize(&list)
+                .into_iter()
+                .filter_map(|sess| {
+                    // keep only sessions with 'valid' times, that appear
+                    // in correct time order in the log file, and that
+                    // are longer than the minimum duration, and shorter
+                    // than the maximum.
+                    if let (
+                        Session {
+                            time: SessionTime::Valid(valid),
+                            ..
+                        },
+                        OrderCorrectness::InOrder,
+                    ) = sess
+                    {
+                        if valid.duration < *args.min_duration {
+                            return None;
                         }
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                        if valid.duration > *args.max_duration {
+                            return None;
+                        }
+                        Some(valid)
+                    } else {
+                        if args.show_weird {
+                            eprintln!("{name:?}: {sess:?}");
+                        }
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            (name, sessions)
         })
         .collect::<Vec<_>>();
 
@@ -591,10 +592,9 @@ impl<T, Reducer: PureReducer<CountInstant, T>> ChunkCombiner<T> for Reducer {
             } else {
                 (initial, changes)
             };
-            return rest
-                .iter()
+            rest.iter()
                 .cloned()
-                .fold(Self::single(initial), Self::reduce);
+                .fold(Self::single(initial), Self::reduce)
         } else {
             Self::single(initial)
         }
@@ -649,6 +649,10 @@ struct Args {
     /// sessions with durations longer than this will be filtered out
     #[arg(long, default_value = "1d")]
     max_duration: humantime::Duration,
+
+    /// log to stderr all the sessions with missing starts/ends and timetravels
+    #[arg(long)]
+    show_weird: bool,
 }
 
 fn main() -> Result<()> {
@@ -667,7 +671,7 @@ mod tests {
     #[test]
     fn fab() -> Result<()> {
         let args = Args {
-            paths: glob("machine/FAB??.csv")?.into_iter().try_collect()?,
+            paths: glob("machine/FAB??.csv")?.try_collect()?,
             granularity: humantime::Duration::from_str("1m")?,
             combine: CombiningOperationKind::Max,
             start_date: None,
@@ -675,6 +679,7 @@ mod tests {
             multi_user: true,
             min_duration: humantime::Duration::from_str("1m")?,
             max_duration: humantime::Duration::from_str("1d")?,
+            show_weird: false,
         };
 
         go(args)
