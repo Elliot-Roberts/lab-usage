@@ -1,8 +1,7 @@
 #![feature(iter_array_chunks)]
-#![feature(iter_map_windows)]
 use color_eyre::{
-    eyre::{bail, eyre},
     Result,
+    eyre::{bail, eyre},
 };
 use itertools::Itertools;
 use std::{
@@ -16,7 +15,7 @@ use std::{
     path::PathBuf,
     time::Duration,
 };
-use time::{format_description::well_known::Iso8601, Date, PrimitiveDateTime, Time};
+use time::{Date, PrimitiveDateTime, Time, format_description::well_known::Iso8601};
 
 /// Relevant action a user might take on a host
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -471,7 +470,7 @@ fn go(args: Args) -> Result<()> {
     if let Some(start_date) = args.start_date {
         cleaned
             .iter_mut()
-            .for_each(|(_, ref mut list)| list.retain(|e| e.time.date() >= start_date));
+            .for_each(|(_, list)| list.retain(|e| e.time.date() >= start_date));
     };
     let cleaned: Vec<_> = if args.multi_user {
         cleaned
@@ -606,7 +605,8 @@ impl ChunkCombiner<f32> for AverageCombiner {
         let sum_user_seconds: usize = once(&initial)
             .chain(changes)
             .chain(once(&(initial.0 + bucket_size, 0)))
-            .map_windows(|[(start_time, start_val), (end_time, _)]| {
+            .tuple_windows()
+            .map(|((start_time, start_val), (end_time, _))| {
                 ((*end_time - *start_time).unsigned_abs(), start_val)
             })
             .map(|(duration, users)| duration.as_secs() as usize * users)
@@ -672,7 +672,7 @@ mod tests {
         let args = Args {
             paths: glob("machine/FAB??.csv")?
                 .into_iter()
-                .collect::<Result<Vec<PathBuf>, _>>()?,
+                .collect::<Result<Vec<_>, _>>()?,
             granularity: humantime::Duration::from_str("1m")?,
             combine: CombiningOperationKind::Max,
             start_date: None,
