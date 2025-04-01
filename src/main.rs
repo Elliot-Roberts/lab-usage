@@ -1,4 +1,3 @@
-#![feature(iterator_try_collect)]
 #![feature(iter_array_chunks)]
 #![feature(iter_map_windows)]
 use color_eyre::{
@@ -671,7 +670,9 @@ mod tests {
     #[test]
     fn fab() -> Result<()> {
         let args = Args {
-            paths: glob("machine/FAB??.csv")?.try_collect()?,
+            paths: glob("machine/FAB??.csv")?
+                .into_iter()
+                .collect::<Result<Vec<PathBuf>, _>>()?,
             granularity: humantime::Duration::from_str("1m")?,
             combine: CombiningOperationKind::Max,
             start_date: None,
