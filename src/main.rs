@@ -1,4 +1,3 @@
-#![feature(iter_array_chunks)]
 use color_eyre::{
     Result,
     eyre::{bail, eyre},
@@ -65,8 +64,8 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
         let mut events = Vec::new();
         for (i, line) in BufReader::new(File::open(path)?).lines().enumerate() {
             let line = line?;
-            let mut array_chunks = line.split(',').array_chunks::<6>();
-            let Some(record) = array_chunks.next() else {
+            let fields = line.split(',').next_tuple();
+            let Some(record) = fields else {
                 // line had fewer than 6 comma separated fields
                 if line.trim().is_empty() {
                     // ignore empty lines
@@ -75,7 +74,7 @@ fn read_from_paths(paths: &[PathBuf]) -> Result<Vec<(OsString, Vec<Event>)>> {
                 }
                 continue;
             };
-            let [user, action, _host, _ip, time, _domain] = record;
+            let (user, action, _host, _ip, time, _domain) = record;
             if time.len() != 12 {
                 eprintln!("malformed datetime on line {i} in {path:?}: {time}");
             }
